@@ -8,6 +8,7 @@
 import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
+	type Message,
 	normalizeContext,
 	type RetryCallbacks,
 	type RetryPolicy,
@@ -143,6 +144,15 @@ export interface CompactionSettings {
 	reserveTokens: number;
 	keepRecentTokens: number;
 }
+
+const EMPTY_USAGE: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
@@ -553,6 +563,210 @@ const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation mes
 
 ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
 
+const CHUNK_SUMMARIZATION_PROMPT = `The messages above are one part of a long conversation that is being summarized in chunks. Create a structured partial summary for THIS part only.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish in this part, if identifiable]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned in this part]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes in this part]
+
+### In Progress
+- [ ] [Work in progress at the end of this part]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+
+const MERGE_SUMMARIES_PROMPT = `The texts above are partial summaries of consecutive parts of one conversation. Merge them into ONE summary that preserves the section structure used in the partial summaries.
+
+- Deduplicate items repeated across parts.
+- Merge Progress sections: completed work stays under "Done"; only the latest state stays under "In Progress".
+- Preserve exact file paths, function names, and error messages.
+- Add a "## Next Steps" section if the partial summaries contain one and the merged result lacks it.
+
+Keep each section concise.`;
+
+/** Characters per token for prompt-size estimation (conservative overestimate). */
+const CHARS_PER_TOKEN_ESTIMATE = 4;
+
+/**
+ * Whether a summarization prompt fits the model's context window alongside the
+ * reserved output tokens. Models with an unknown window keep the previous
+ * unbounded behavior.
+ */
+function promptFitsModelContext(model: Model<any>, maxTokens: number, promptText: string): boolean {
+	const contextWindow = model.contextWindow > 0 ? model.contextWindow : 0;
+	if (contextWindow <= 0) return true;
+	const promptTokens = Math.ceil((SUMMARIZATION_SYSTEM_PROMPT.length + promptText.length) / CHARS_PER_TOKEN_ESTIMATE);
+	return promptTokens + maxTokens <= contextWindow;
+}
+
+/**
+ * Truncate serialized text until `fits` accepts it (fit is monotonic in text
+ * length, so binary search finds the largest kept prefix).
+ */
+function truncateToFitModelContext(text: string, fits: (text: string) => boolean): string {
+	if (fits(text)) return text;
+	// The marker appended below is also what the fit check sees, so the result
+	// is guaranteed to satisfy `fits`.
+	const markerFor = (kept: number, total: number) =>
+		`\n\n[... ${total - kept} characters truncated to fit the summarization model's context window]`;
+	// Search against the longest possible marker (all digits) so the final
+	// string with its real count can only be shorter-or-equal.
+	const worstMarker = markerFor(0, 10 ** Math.ceil(Math.log10(text.length + 1)) - 1);
+	let lo = 0;
+	let hi = text.length;
+	while (lo < hi) {
+		const mid = Math.ceil((lo + hi) / 2);
+		if (fits(`${text.slice(0, mid)}${worstMarker}`)) lo = mid;
+		else hi = mid - 1;
+	}
+	const result = `${text.slice(0, lo)}${markerFor(lo, text.length)}`;
+	return result;
+}
+
+/**
+ * Serialize LLM messages and group them into consecutive chunks whose wrapped
+ * prompt satisfies `fits`. A single message larger than the budget is truncated
+ * so the request still goes through.
+ */
+function chunkSerializedConversation(llmMessages: Message[], fits: (conversationText: string) => boolean): string[] {
+	const chunks: string[] = [];
+	let current = "";
+	for (const msg of llmMessages) {
+		let text = serializeConversation([msg]);
+		if (!text) continue;
+		const candidate = current ? `${current}\n\n${text}` : text;
+		if (fits(candidate)) {
+			current = candidate;
+			continue;
+		}
+		if (current) chunks.push(current);
+		if (!fits(text)) {
+			text = truncateToFitModelContext(text, fits);
+		}
+		current = text;
+	}
+	if (current) chunks.push(current);
+	return chunks;
+}
+
+/** Shared options for one summarization call. */
+interface SummarizationCallDeps {
+	model: Model<any>;
+	maxTokens: number;
+	apiKey: string | undefined;
+	headers?: Record<string, string>;
+	env?: Record<string, string>;
+	signal?: AbortSignal;
+	thinkingLevel?: ThinkingLevel;
+	streamFn?: StreamFn;
+	retry?: RetryPolicy;
+	callbacks?: RetryCallbacks;
+	sessionId?: string;
+}
+
+/** Run one summarization request and validate the response. */
+async function runSummarizationCall(
+	promptText: string,
+	label: string,
+	deps: SummarizationCallDeps,
+): Promise<{ text: string; usage: Usage }> {
+	const response = await completeSummarization(
+		deps.model,
+		buildSummarizationContext(promptText),
+		createSummarizationOptions(
+			deps.model,
+			deps.maxTokens,
+			deps.apiKey,
+			deps.headers,
+			deps.env,
+			deps.signal,
+			deps.thinkingLevel,
+			deps.sessionId,
+		),
+		deps.streamFn,
+		deps.retry,
+		deps.callbacks,
+	);
+	const failure = getSummarizationFailure(response, label);
+	if (failure) {
+		throw new Error(failure);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		throw new Error(`${label} attempted to call a tool`);
+	}
+	return { text: contentText(response.content), usage: response.usage };
+}
+
+/**
+ * Merge partial summaries into one text, grouping as many per request as fit
+ * the model's context window and recursing until a single summary remains.
+ */
+async function mergeSummaryTexts(
+	texts: string[],
+	wrapPrompt: (joined: string) => string,
+	label: string,
+	deps: SummarizationCallDeps,
+): Promise<{ text: string; usage: Usage | undefined }> {
+	let usage: Usage | undefined;
+	const fits = (joined: string) => promptFitsModelContext(deps.model, deps.maxTokens, wrapPrompt(joined));
+	while (texts.length > 1) {
+		// Greedy grouping of consecutive summaries that fit in one request.
+		const groups: string[][] = [];
+		for (const text of texts) {
+			const last = groups[groups.length - 1];
+			if (last && fits([...last, text].join("\n\n---\n\n"))) {
+				last.push(text);
+			} else {
+				groups.push([text]);
+			}
+		}
+		const next: string[] = [];
+		if (groups.length === texts.length) {
+			// No two summaries fit together; merge pairwise with truncation.
+			for (let i = 0; i < texts.length; i += 2) {
+				if (i + 1 === texts.length) {
+					next.push(texts[i]);
+					break;
+				}
+				const joined = truncateToFitModelContext(`${texts[i]}\n\n---\n\n${texts[i + 1]}`, fits);
+				const result = await runSummarizationCall(wrapPrompt(joined), label, deps);
+				usage = usage ? combineUsage(usage, result.usage) : result.usage;
+				next.push(result.text);
+			}
+		} else {
+			for (const group of groups) {
+				if (group.length === 1) {
+					next.push(group[0]);
+					continue;
+				}
+				const result = await runSummarizationCall(wrapPrompt(group.join("\n\n---\n\n")), label, deps);
+				usage = usage ? combineUsage(usage, result.usage) : result.usage;
+				next.push(result.text);
+			}
+		}
+		texts = next;
+	}
+	return { text: texts[0] ?? "", usage };
+}
+
 /**
  * Returns an error message when a summarization response cannot safely be persisted.
  * A length stop contains partial text and must not become a session checkpoint.
@@ -689,25 +903,7 @@ export async function generateSummaryWithUsage(
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build the prompt with conversation wrapped in tags
-	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
-	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
-	}
-	promptText += basePrompt;
-
-	const completionOptions = createSummarizationOptions(
+	const deps: SummarizationCallDeps = {
 		model,
 		maxTokens,
 		apiKey,
@@ -715,29 +911,87 @@ export async function generateSummaryWithUsage(
 		env,
 		signal,
 		thinkingLevel,
-		sessionId,
-	);
-
-	const response = await completeSummarization(
-		model,
-		buildSummarizationContext(promptText),
-		completionOptions,
 		streamFn,
 		retry,
 		callbacks,
+		sessionId,
+	};
+
+	// Use update prompt if we have a previous summary, otherwise initial prompt
+	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
+	}
+
+	const wrapPrompt = (conversationText: string): string => {
+		let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
+		if (previousSummary) {
+			promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+		}
+		return promptText + basePrompt;
+	};
+
+	// Serialize conversation to text so model doesn't try to continue it
+	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
+	const llmMessages = convertToLlm(currentMessages);
+	const conversationText = serializeConversation(llmMessages);
+
+	// Fast path: the whole conversation plus prompts fit the model's context window.
+	if (promptFitsModelContext(model, maxTokens, wrapPrompt(conversationText))) {
+		return runSummarizationCall(wrapPrompt(conversationText), "Summarization", deps);
+	}
+
+	// The serialized history exceeds this model's context window — typically after
+	// switching from a larger-context model mid-session. Summarize the conversation
+	// in chunks that fit, merge the partial summaries, then fold in the previous
+	// summary (if any) with a final update call.
+	const chunkPrompt = customInstructions
+		? `${CHUNK_SUMMARIZATION_PROMPT}\n\nAdditional focus: ${customInstructions}`
+		: CHUNK_SUMMARIZATION_PROMPT;
+	// Reserve space for the "Part i of N" header added to each chunk request.
+	const chunks = chunkSerializedConversation(llmMessages, (text) =>
+		promptFitsModelContext(
+			model,
+			maxTokens,
+			`<conversation>\n${text}\n</conversation>\n\nPart 9999 of 9999.\n\n${chunkPrompt}`,
+		),
 	);
 
-	const failure = getSummarizationFailure(response, "Summarization");
-	if (failure) {
-		throw new Error(failure);
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Summarization attempted to call a tool");
+	let usage: Usage | undefined;
+	const partials: string[] = [];
+	for (let i = 0; i < chunks.length; i++) {
+		const partHeader = `Part ${i + 1} of ${chunks.length}.\n\n`;
+		const result = await runSummarizationCall(
+			`<conversation>\n${chunks[i]}\n</conversation>\n\n${partHeader}${chunkPrompt}`,
+			`Summarization (part ${i + 1} of ${chunks.length})`,
+			deps,
+		);
+		usage = usage ? combineUsage(usage, result.usage) : result.usage;
+		partials.push(result.text);
 	}
 
-	const textContent = contentText(response.content);
+	const mergeWrap = (joined: string): string =>
+		`<partial-summaries>\n${joined}\n</partial-summaries>\n\n${MERGE_SUMMARIES_PROMPT}`;
+	const merged = await mergeSummaryTexts(partials, mergeWrap, "Summary merge", deps);
+	if (merged.usage) {
+		usage = usage ? combineUsage(usage, merged.usage) : merged.usage;
+	}
 
-	return { text: textContent, usage: response.usage };
+	if (!previousSummary) {
+		return { text: merged.text, usage: usage ?? EMPTY_USAGE };
+	}
+
+	// Fold the merged new-events summary into the previous structured summary.
+	const updatePrompt = customInstructions
+		? `${UPDATE_SUMMARIZATION_PROMPT}\n\nAdditional focus: ${customInstructions}`
+		: UPDATE_SUMMARIZATION_PROMPT;
+	const updateWrap = (newText: string): string =>
+		`<new-events-summary>\n${newText}\n</new-events-summary>\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\n${updatePrompt}`;
+	const fittedText = truncateToFitModelContext(merged.text, (t) =>
+		promptFitsModelContext(model, maxTokens, updateWrap(t)),
+	);
+	const updated = await runSummarizationCall(updateWrap(fittedText), "Summarization", deps);
+	return { text: updated.text, usage: combineUsage(usage ?? EMPTY_USAGE, updated.usage) };
 }
 
 // ============================================================================
@@ -999,29 +1253,55 @@ async function generateTurnPrefixSummary(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	); // Smaller budget for turn prefix
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-
-	const response = await completeSummarization(
+	const deps: SummarizationCallDeps = {
 		model,
-		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
+		maxTokens,
+		apiKey,
+		headers,
+		env,
+		signal,
+		thinkingLevel,
 		streamFn,
 		retry,
 		callbacks,
+		sessionId,
+	};
+	const llmMessages = convertToLlm(messages);
+	const wrapPrompt = (conversationText: string): string =>
+		`<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
+	const conversationText = serializeConversation(llmMessages);
+
+	if (promptFitsModelContext(model, maxTokens, wrapPrompt(conversationText))) {
+		return runSummarizationCall(wrapPrompt(conversationText), "Turn prefix summarization", deps);
+	}
+
+	// Split-turn prefix larger than this model's context window: chunk and merge.
+	const chunks = chunkSerializedConversation(llmMessages, (text) =>
+		promptFitsModelContext(
+			model,
+			maxTokens,
+			`<conversation>\n${text}\n</conversation>\n\nPart 9999 of 9999.\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+		),
 	);
-
-	const failure = getSummarizationFailure(response, "Turn prefix summarization");
-	if (failure) {
-		throw new Error(failure);
+	let usage: Usage | undefined;
+	const partials: string[] = [];
+	for (let i = 0; i < chunks.length; i++) {
+		const result = await runSummarizationCall(
+			`<conversation>\n${chunks[i]}\n</conversation>\n\nPart ${i + 1} of ${chunks.length}.\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+			`Turn prefix summarization (part ${i + 1} of ${chunks.length})`,
+			deps,
+		);
+		usage = usage ? combineUsage(usage, result.usage) : result.usage;
+		partials.push(result.text);
 	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		throw new Error("Turn prefix summarization attempted to call a tool");
-	}
-
+	const merged = await mergeSummaryTexts(
+		partials,
+		(joined) => `<partial-summaries>\n${joined}\n</partial-summaries>\n\n${MERGE_SUMMARIES_PROMPT}`,
+		"Turn prefix summary merge",
+		deps,
+	);
 	return {
-		text: contentText(response.content),
-		usage: response.usage,
+		text: merged.text,
+		usage: merged.usage ? combineUsage(usage ?? EMPTY_USAGE, merged.usage) : (usage ?? EMPTY_USAGE),
 	};
 }
