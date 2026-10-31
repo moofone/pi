@@ -184,18 +184,14 @@ describe("createAgentSession stream options", () => {
 		};
 	}
 
-	it("schedules cache warming after a completed session request", async () => {
+	it("blocks warming when adapter surface coverage is unknown", async () => {
 		const fixture = await createCacheWarmingSession();
 		try {
 			await fixture.session.prompt("test");
-			expect(fixture.session.cacheWarmingStatus?.nextWarmAt).toBeGreaterThan(Date.now());
-
-			// Equivalent shallow copies remain current, but removing the request prefix does not.
-			fixture.session.agent.state.messages = [...fixture.session.agent.state.messages];
-			fixture.session.agent.state.model = { ...fixture.session.agent.state.model };
-			expect(fixture.session.cacheWarmingStatus?.nextWarmAt).toBeGreaterThan(Date.now());
-			fixture.session.agent.state.messages = fixture.session.agent.state.messages.slice(1);
-			expect(fixture.session.cacheWarmingStatus?.reason).toBe("conversation context changed");
+			// Anthropic has no final-boundary capture in v1. A configured warming mode
+			// or extension override must not silently rebaseline an unchecked request.
+			expect(fixture.session.cacheWarmingStatus?.reason).toBe("cache surface not preserved");
+			expect(fixture.session.cacheWarmingStatus?.nextWarmAt).toBeUndefined();
 		} finally {
 			fixture.dispose();
 		}
