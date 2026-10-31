@@ -6,6 +6,12 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
+import {
+	type CacheSurfaceStatus,
+	CacheSurfaceTracker,
+	formatCacheSurfaceNotice,
+	semanticHash,
+} from "./cache-surface.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -101,6 +107,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
+	/** Request-scoped, non-blocking cache-surface diagnostics. Never a provider-hit guarantee. */
+	onCacheSurface?: (status: CacheSurfaceStatus) => void;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
 }
@@ -109,6 +117,8 @@ export interface CreateAgentSessionOptions {
 export interface CreateAgentSessionResult {
 	/** The created session */
 	session: AgentSession;
+	/** Shared request evidence; unsupported adapters/transports remain unknown. */
+	cacheSurface: CacheSurfaceTracker;
 	/** Extensions result (for UI context setup in interactive mode) */
 	extensionsResult: LoadExtensionsResult;
 	/** Warning if session was restored with a different model than saved */
@@ -331,11 +341,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
+	const cacheSurface = new CacheSurfaceTracker(
+		sessionManager,
+		() => ({
+			tools: agent.state.tools.map((tool) => ({
+				name: tool.name,
+				definitionSha256: semanticHash({
+					name: tool.name,
+					description: tool.description,
+					parameters: tool.parameters,
+				}),
+			})),
+			systemPromptSha256: semanticHash(agent.state.systemPrompt),
+		}),
+		(status) => {
+			options.onCacheSurface?.(status);
+			if (status.state !== "preserved" || status.cacheRead === 0)
+				extensionRunnerRef.current
+					?.getUIContext()
+					.notify(status.cacheNotice ?? formatCacheSurfaceNotice(status), "warning");
+		},
+	);
 	const cacheWarmer = new CacheWarmer(
 		modelRuntime,
 		sessionManager,
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
+		() => (cacheSurface.status.state === "preserved" ? undefined : "cache surface not preserved"),
 	);
 	const buildRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
@@ -385,7 +417,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			headers: response.headers,
 		});
 	};
-	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
+	const forwardProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
 		data,
 		model,
 	) => {
@@ -400,6 +432,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 	};
 
+	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
+		data,
+		model,
+	) => {
+		cacheSurface.recordOutcome(data);
+		await forwardProviderStreamEvent(data, model);
+	};
+
 	const agent = new Agent({
 		initialState: {
 			systemPrompt: "",
@@ -410,14 +450,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
+			cacheSurface.beginRequest();
 			const requestOptions = buildRequestOptions(options);
+			if (model.api === "openai-codex-responses" && requestOptions.transport === "sse") {
+				requestOptions.fetch = cacheSurface.wrapFetch(requestOptions);
+			} else cacheSurface.unsupported();
 			// Compaction and summaries use their own routing ids; only session requests
 			// replace the cache entry, so warming restarts from them. Keep warming while
 			// the current transcript still extends the request's prefix. Agent state may
 			// shallow-copy the messages array or refresh the model object without changing
 			// the provider request, so top-level object identity is not a valid cache key.
 			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+				// Warm requests must re-check the final surface and cannot launder drift.
+				const warmOptions = buildRequestOptions(options);
+				warmOptions.fetch = cacheSurface.wrapFetch(warmOptions, "warm");
+				warmOptions.onProviderStreamEvent = forwardProviderStreamEvent;
+				const isCurrent = cacheContextIsCurrent(model);
+				cacheWarmer.start({ model, context, options: warmOptions }, isCurrent);
 			}
 			return modelRuntime.streamSimple(model, context, requestOptions);
 		},
@@ -471,10 +520,55 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionStartEvent: options.sessionStartEvent,
 	});
 
+	agent.subscribe((event) => {
+		if (event.type === "message_end" && event.message.role === "assistant")
+			cacheSurface.recordAssistant(event.message);
+	});
+	// Existing transcript restoration remains authoritative. Only an explicit unsent intent
+	// supplements it; binding observations never become submitted loadouts.
+	const intent = cacheSurface.getToolIntent();
+	if (intent && options.tools === undefined) {
+		const available = new Set(session.getAllTools().map((tool) => tool.name));
+		session.setActiveToolsByName(intent.filter((name) => available.has(name)));
+	}
+	const setActiveTools = session.setActiveToolsByName.bind(session);
+	session.setActiveToolsByName = (names) => {
+		setActiveTools(names);
+		cacheSurface.recordToolIntent(session.getActiveToolNames());
+		cacheSurface.observe();
+	};
+	const bindExtensions = session.bindExtensions.bind(session);
+	session.bindExtensions = async (...args) => {
+		const result = await bindExtensions(...args);
+		// Suppress only unmentioned automatic registrations, after the SDK restored
+		// transcript order and applied explicit tools/defaultTools modifiers.
+		const submittedNames = cacheSurface.getSubmittedToolNames();
+		if (submittedNames && !cacheSurface.getToolIntent()) {
+			const mentioned = new Set(submittedNames);
+			for (const entry of sessionManager.getBranch()) {
+				if (entry.type === "message" && entry.message.role === "system") {
+					for (const tool of entry.message.toolsAdded ?? []) mentioned.add(tool.name);
+				}
+			}
+			const configured = options.tools ?? settingsManager.getDefaultTools() ?? [];
+			const explicit = createToolNameMatcher(
+				configured
+					.filter((name) => !name.startsWith("-"))
+					.map((name) => (name.startsWith("+") ? name.slice(1) : name)),
+			);
+			const active = session.getActiveToolNames();
+			const intended = active.filter((name) => mentioned.has(name) || explicit(name));
+			if (intended.length !== active.length) setActiveTools(intended);
+		}
+		if (options.tools) cacheSurface.recordToolIntent(session.getActiveToolNames(), "tools-option");
+		cacheSurface.observe();
+		return result;
+	};
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
 		session,
+		cacheSurface,
 		extensionsResult,
 		modelFallbackMessage,
 	};

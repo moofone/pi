@@ -165,6 +165,7 @@ export class CacheWarmer {
 	private readonly models: Pick<ModelRuntime, "streamSimple">;
 	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
 	private readonly getMode: () => CacheWarmingMode;
+	private readonly surfaceStopReason: () => string | undefined;
 	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
 	private readonly decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction>;
 	/** Called with the persisted usage entry after each successful refresh. */
@@ -175,11 +176,13 @@ export class CacheWarmer {
 		sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">,
 		getMode: () => CacheWarmingMode,
 		decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction> = async (event) => event.action,
+		surfaceStopReason: () => string | undefined = () => undefined,
 	) {
 		this.models = models;
 		this.sessionManager = sessionManager;
 		this.getMode = getMode;
 		this.decide = decide;
+		this.surfaceStopReason = surfaceStopReason;
 		this.inactive = { state: "inactive", reason: "waiting for first request" };
 	}
 
@@ -187,6 +190,8 @@ export class CacheWarmer {
 		if (this.getMode() === "off") return { state: "inactive", reason: "cache warming disabled" };
 		const run = this.run;
 		if (!run) return this.inactive;
+		const surfaceReason = this.surfaceStopReason();
+		if (surfaceReason) return { state: "inactive", reason: surfaceReason };
 		if (!run.isCurrent()) return { state: "inactive", reason: "conversation context changed" };
 		const decision = this.evaluate(run);
 		const refreshing = run.timer === undefined;
@@ -362,7 +367,10 @@ export class CacheWarmer {
 
 	private validateRun(run: ActiveRun): boolean {
 		if (this.run !== run) return false;
-		const reason = this.getModeStopReason(run) ?? (!run.isCurrent() ? "conversation context changed" : undefined);
+		const reason =
+			this.getModeStopReason(run) ??
+			this.surfaceStopReason() ??
+			(!run.isCurrent() ? "conversation context changed" : undefined);
 		if (!reason) return true;
 		this.stop(reason);
 		return false;
